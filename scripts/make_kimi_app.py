@@ -138,35 +138,37 @@ def _resolve_build_token() -> str:
 
 
 LAUNCHER = r"""#!/bin/bash
-# A Finder-launched app cannot see your shell's HF_TOKEN or conda python3, and
-# running an interactive shell as the main process exits instantly (the icon
-# just bounces). So the builder BAKES the token + python path in at build time
-# (captured from your terminal, where they exist). No runtime shell resolution.
+# This app does NOT stay running. It starts the chat server detached (nohup),
+# opens the browser, and exits cleanly. That avoids the "application is not open
+# anymore" error you get when a GUI app's main process blocks or dies. The token
+# + python path are baked in at build time (a Finder launch can't read ~/.zshrc).
 LOG="$HOME/Library/Logs/Kimi.log"
-exec >>"$LOG" 2>&1
-echo "=== Kimi launch $(date) ==="
 PORT=__PORT__
 URL="http://127.0.0.1:$PORT"
 
-# Runtime env wins if present (e.g. launched from a terminal), else the baked value.
 export HF_TOKEN="${HF_TOKEN:-__TOKEN__}"
 PY="__PYTHON__"
 [ -x "$PY" ] || PY="$(command -v python3 || echo /usr/bin/python3)"
-echo "python=$PY token_len=${#HF_TOKEN}"
+
+{
+  echo "=== Kimi launch $(date) ==="
+  echo "python=$PY token_len=${#HF_TOKEN}"
+} >>"$LOG" 2>&1
 
 if [ -z "$HF_TOKEN" ]; then
   osascript -e 'display dialog "Kimi has no HF_TOKEN baked in. Re-run the builder from a terminal where HF_TOKEN is set:\n\n  python3 ~/hermes-agent/scripts/make_kimi_app.py" buttons {"OK"} with title "Kimi" with icon caution'
-  exit 1
-fi
-
-if lsof -ti:"$PORT" >/dev/null 2>&1; then
-  echo "server already up; opening browser"
-  open "$URL"
   exit 0
 fi
-( sleep 1.2; open "$URL" ) &
-echo "starting server: $PY __HFUI__"
-exec "$PY" "__HFUI__" "$HF_TOKEN"
+
+# Start the server only if it is not already listening.
+if ! lsof -ti:"$PORT" >/dev/null 2>&1; then
+  echo "starting server: $PY __HFUI__" >>"$LOG" 2>&1
+  nohup "$PY" "__HFUI__" "$HF_TOKEN" >>"$LOG" 2>&1 &
+  sleep 1.6
+fi
+
+open "$URL"
+exit 0
 """
 
 
