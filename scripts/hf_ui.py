@@ -176,6 +176,26 @@ PAGE = r"""<!doctype html>
   .approve button.no{background:var(--error);color:#1a0f12;border:none}
   .approve .amsg{font-size:12px;color:var(--warning)}
   .approve .amsg.ok{color:var(--success)} .approve .amsg.no{color:var(--error)}
+  /* design preference prompt */
+  .design-q .atool-h{color:var(--warning)}
+  .dq-body{padding:10px 11px;display:flex;flex-direction:column;gap:9px}
+  .dq-q{font-size:13.5px;color:var(--text)}
+  .dq-opts{display:flex;flex-wrap:wrap;gap:6px}
+  .dq-opt{padding:5px 11px;font-size:12px;background:var(--surface);
+    border:1px solid var(--border);border-radius:var(--radius);color:var(--text)}
+  .dq-opt:hover{border-color:var(--accent);color:var(--accent)}
+  .dq-row{display:flex;gap:7px}
+  .dq-in{flex:1;background:var(--bg);border:1px solid var(--border);
+    border-radius:var(--radius);padding:7px 9px;font-size:13px;outline:none}
+  .dq-in:focus{border-color:var(--border-focus);box-shadow:0 0 0 2px rgba(177,140,255,.18)}
+  .dq-send{background:var(--accent);color:var(--bg);border:none;font-weight:600;padding:7px 13px}
+  .dq-send:hover{background:var(--accent-strong);color:var(--text)}
+  .dq-saved{font-size:12.5px;color:var(--success)}
+  /* design profile panel */
+  .dp-item{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);
+    padding:6px 8px;margin-bottom:5px}
+  .dp-q{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+  .dp-a{font-size:12px;color:var(--accent);margin-top:2px;word-break:break-word}
   ::-webkit-scrollbar{width:9px;height:9px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
@@ -221,6 +241,12 @@ PAGE = r"""<!doctype html>
       <div class="sb-label">Live usage <button id="usageRefresh" class="mini" title="Refresh">↻</button></div>
       <div id="usageGrid" class="usage-grid"><div class="muted small">— send a message —</div></div>
       <div class="muted small" id="usageTime" style="margin-top:6px"></div>
+    </div>
+    <div class="sb-sec">
+      <div class="sb-label">Design profile
+        <button id="designClear" class="mini" title="Forget all preferences">clear</button></div>
+      <div id="designList"><div class="muted small">Nothing learned yet — the agent
+        will ask about your style as it builds.</div></div>
     </div>
     <div class="sb-sec" style="border-bottom:none">
       <button id="clear" class="ghost">Clear conversation</button>
@@ -372,6 +398,21 @@ function resolveApproval(id,decision,ap){
   fetch("/api/agent/approve",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({id,decision})}).catch(()=>{});
 }
+function answerDesign(id,answer,card){
+  const body=card.querySelector(".dq-body");
+  if(body) body.innerHTML='<div class="dq-saved">saving…</div>';
+  fetch("/api/agent/answer",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id,answer})}).catch(()=>{});
+}
+async function loadDesign(){
+  try{
+    const r=await fetch("/api/design"); const d=await r.json();
+    const prefs=d.prefs||[];
+    if(!prefs.length){ $("#designList").innerHTML='<div class="muted small">Nothing learned yet — the agent will ask about your style as it builds.</div>'; return; }
+    $("#designList").innerHTML=prefs.map(p=>
+      '<div class="dp-item"><div class="dp-q">'+esc(p.q||"")+'</div><div class="dp-a">'+esc(p.a||"")+'</div></div>').join("");
+  }catch(e){ /* leave as-is */ }
+}
 function handleAgentEvent(ev,root,cards){
   if(ev.type==="step"){
     const d=document.createElement("div"); d.className="astep";
@@ -401,6 +442,27 @@ function handleAgentEvent(ev,root,cards){
     const d=cards&&cards[ev.id]; if(!d) return; const ap=d.querySelector(".approve"); if(!ap) return;
     const k=ev.decision==="approve"?"ok":"no";
     ap.innerHTML='<span class="amsg '+k+'">'+esc(ev.decision||"")+'</span>';
+  } else if(ev.type==="design_question"){
+    const d=document.createElement("div"); d.className="atool design-q";
+    let opts="";
+    if(ev.options && ev.options.length){
+      opts='<div class="dq-opts">'+ev.options.map(o=>'<button class="dq-opt">'+esc(o)+'</button>').join("")+'</div>';
+    }
+    d.innerHTML='<div class="atool-h">✎ design preference</div>'+
+      '<div class="dq-body"><div class="dq-q">'+esc(ev.question||"")+'</div>'+opts+
+      '<div class="dq-row"><input class="dq-in" type="text" placeholder="your preference…">'+
+      '<button class="dq-send">Save</button></div></div>';
+    root.appendChild(d); if(cards) cards[ev.id]=d;
+    const inp=d.querySelector(".dq-in"), sb=d.querySelector(".dq-send");
+    const go=v=>{ v=(v||"").trim(); if(v) answerDesign(ev.id,v,d); };
+    sb.onclick=()=>go(inp.value);
+    inp.addEventListener("keydown",e=>{ if(e.key==="Enter"){e.preventDefault();go(inp.value);}});
+    d.querySelectorAll(".dq-opt").forEach(b=>b.onclick=()=>go(b.textContent));
+    inp.focus();
+  } else if(ev.type==="design_answer"){
+    const d=cards&&cards[ev.id]; if(d){ const body=d.querySelector(".dq-body");
+      if(body) body.innerHTML='<div class="dq-saved">✓ saved: '+esc(ev.answer||"")+'</div>'; }
+    loadDesign();
   } else if(ev.type==="tool_result"){
     const d=document.createElement("details"); d.className="aresult";
     d.innerHTML='<summary>output</summary><pre><code>'+esc(ev.output||"")+'</code></pre>';
@@ -447,7 +509,7 @@ async function runAgent(){
     root.insertAdjacentHTML("beforeend",'<div class="aerr">'+esc(String(e))+'</div>'); } }
   if(finalText) history.push({role:"assistant",content:finalText});
   busy=false; send.disabled=false; $("#stop").style.display="none"; agentCtrl=null;
-  box.focus(); scrollDown(); loadUsage();
+  box.focus(); scrollDown(); loadUsage(); loadDesign();
 }
 function submit(){ if($("#agent").checked) runAgent(); else ask(); }
 // ── Events ───────────────────────────────────────────────────────────────
@@ -461,11 +523,13 @@ $("#agent").addEventListener("change",e=>{
 });
 $("#clear").onclick=clearChat;
 $("#usageRefresh").onclick=loadUsage;
+$("#designClear").onclick=()=>{ if(!confirm("Forget all saved design preferences?")) return;
+  fetch("/api/design/clear",{method:"POST"}).then(loadDesign).catch(()=>{}); };
 document.addEventListener("keydown",e=>{
   if(e.ctrlKey && e.key.toLowerCase()==="b"){ e.preventDefault(); sidebar.classList.toggle("collapsed"); }
   if(e.ctrlKey && e.key.toLowerCase()==="l"){ e.preventDefault(); clearChat(); box.focus(); }
 });
-loadModels(); loadUsage(); box.focus();
+loadModels(); loadUsage(); loadDesign(); box.focus();
 </script>
 </body>
 </html>
@@ -556,6 +620,22 @@ AGENT_TOOLS = [
         "description": "List the entries in a directory.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "ask_design_pref",
+        "description": "Ask the user ONE design/style question when a visual or "
+                       "UX decision genuinely turns on personal taste — color "
+                       "palette, light/dark, layout density, typography, framework, "
+                       "tone/voice, animation, spacing, etc. The answer is saved to "
+                       "the user's persistent design profile and reused on future "
+                       "projects, so this is how you LEARN their style. Ask only at "
+                       "real forks you can't settle from saved preferences or "
+                       "sensible defaults, and ask one crisp question at a time.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string",
+                         "description": "The single design question to ask."},
+            "options": {"type": "array", "items": {"type": "string"},
+                        "description": "Optional 2-4 suggested choices to click."}},
+            "required": ["question"]}}},
 ]
 
 AGENT_SYSTEM = (
@@ -568,8 +648,67 @@ AGENT_SYSTEM = (
     "(read files, list dirs, run commands), make the change, then verify it "
     "(run the build/tests). Prefer paths relative to the working directory. Be "
     "careful with destructive commands. When the goal is complete, stop calling "
-    "tools and reply with a short summary of what you did and how you verified it."
+    "tools and reply with a short summary of what you did and how you verified it.\n\n"
+    "DESIGN STYLE: whenever the goal involves building or styling anything visual "
+    "(a UI, web page, component, theme, document), use the ask_design_pref tool at "
+    "genuine taste forks so you learn this user's preferences over time. Apply "
+    "their saved preferences automatically and don't re-ask what you already know. "
+    "Ask sparingly — one sharp question at a time, only when the choice truly "
+    "depends on taste — then keep building with their answer."
 )
+
+
+DESIGN_PROFILE = os.path.expanduser("~/.hermes_design_profile.json")
+
+
+def _load_design_prefs() -> list:
+    """Return the saved design preferences (list of {q,a,ts}); [] if none."""
+    try:
+        with open(DESIGN_PROFILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("prefs", []) if isinstance(d, dict) else []
+    except Exception:
+        return []
+
+
+def _record_design_pref(question: str, answer: str) -> None:
+    """Append a learned preference to the persistent profile."""
+    question, answer = (question or "").strip(), (answer or "").strip()
+    if not answer:
+        return
+    prefs = _load_design_prefs()
+    prefs.append({"q": question, "a": answer,
+                  "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")})
+    try:
+        with open(DESIGN_PROFILE, "w", encoding="utf-8") as f:
+            json.dump({"prefs": prefs,
+                       "updated": datetime.datetime.now().isoformat(timespec="seconds")},
+                      f, indent=2)
+    except Exception:
+        pass
+
+
+def _design_prefs_dedup() -> list:
+    """Latest answer per question, oldest→newest, for display and injection."""
+    seen: dict = {}
+    for p in _load_design_prefs():
+        q = (p.get("q") or "").strip()
+        if q:
+            seen[q] = {"q": q, "a": (p.get("a") or "").strip(), "ts": p.get("ts", "")}
+    return list(seen.values())
+
+
+def _design_prefs_block() -> str:
+    """System-prompt snippet listing what we already know about their style."""
+    prefs = _design_prefs_dedup()
+    if not prefs:
+        return ""
+    lines = [f"- {p['q']} → {p['a']}" for p in prefs[-40:] if p["a"]]
+    if not lines:
+        return ""
+    return ("\n\nKNOWN DESIGN PREFERENCES (learned from this user on past "
+            "projects — honor these unless the current goal explicitly says "
+            "otherwise; do not re-ask them):\n" + "\n".join(lines))
 
 
 def _trunc(s: str, n: int = 6000) -> str:
@@ -684,6 +823,35 @@ def run_agent(model, messages, workdir, max_steps, max_tokens, temperature,
             except Exception:
                 a = {"_raw": raw}
             tcid = tc.get("id") or f"s{step}-{name}"
+
+            if name == "ask_design_pref":
+                question = (a.get("question") or "").strip()
+                options = a.get("options") or []
+                if _AGENT["cancel"]:
+                    result = "(stopped by user)"
+                else:
+                    ev = threading.Event()
+                    _PENDING[tcid] = {"event": ev, "answer": None}
+                    yield {"type": "design_question", "id": tcid,
+                           "question": question, "options": options}
+                    ok = ev.wait(600)
+                    answer = (_PENDING.pop(tcid, {}) or {}).get("answer") if ok else None
+                    if _AGENT["cancel"]:
+                        result = "(stopped by user)"
+                    elif answer:
+                        _record_design_pref(question, answer)
+                        yield {"type": "design_answer", "id": tcid, "answer": answer}
+                        result = (f"User's preference: {answer}\n"
+                                  "(Saved to their design profile — apply it now and "
+                                  "remember it for future projects.)")
+                    else:
+                        result = ("(no answer received — use a tasteful default and "
+                                  "keep going).")
+                yield {"type": "tool_result", "name": name, "output": result, "id": tcid}
+                messages.append({"role": "tool", "tool_call_id": tc.get("id"),
+                                 "name": name, "content": result})
+                continue
+
             need_ok = approve_each and name in APPROVAL_TOOLS and not _AGENT["cancel"]
             yield {"type": "tool_call", "name": name, "args": a, "id": tcid,
                    "needs_approval": need_ok}
@@ -765,6 +933,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 data["account"] = {"error": str(e)[:120]}
             self._json(200, data)
+        elif self.path == "/api/design":
+            self._json(200, {"prefs": _design_prefs_dedup()})
         else:
             self._json(404, {"error": "not found"})
 
@@ -783,6 +953,24 @@ class Handler(BaseHTTPRequestHandler):
                 rec["decision"] = p.get("decision", "deny")
                 rec["event"].set()
             return self._json(200, {"ok": bool(rec)})
+        if self.path == "/api/agent/answer":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                p = json.loads(self.rfile.read(n).decode())
+            except Exception as e:
+                return self._json(400, {"error": str(e)})
+            rec = _PENDING.get(p.get("id"))
+            if rec:
+                rec["answer"] = (p.get("answer") or "").strip()
+                rec["event"].set()
+            return self._json(200, {"ok": bool(rec)})
+        if self.path == "/api/design/clear":
+            try:
+                if os.path.exists(DESIGN_PROFILE):
+                    os.remove(DESIGN_PROFILE)
+            except Exception as e:
+                return self._json(200, {"error": str(e)})
+            return self._json(200, {"ok": True})
         if self.path == "/api/agent":
             return self._agent()
         if self.path != "/api/chat":
@@ -809,7 +997,8 @@ class Handler(BaseHTTPRequestHandler):
         max_tokens = int(p.get("max_tokens", 4096))
         temperature = float(p.get("temperature", 0.3))
         approve_each = bool(p.get("approve_each"))
-        messages = ([{"role": "system", "content": AGENT_SYSTEM.format(workdir=workdir)}]
+        sys_content = AGENT_SYSTEM.format(workdir=workdir) + _design_prefs_block()
+        messages = ([{"role": "system", "content": sys_content}]
                     + list(p.get("history") or [])
                     + [{"role": "user", "content": goal}])
         self.send_response(200)
