@@ -126,7 +126,7 @@ PAGE = r"""<!doctype html>
   <div class="stat" id="totals">0 tokens · $0.00000</div>
 </header>
 <div class="settings">
-  <label>max tokens <input id="maxtok" type="number" min="64" max="32000" step="64" value="2048"></label>
+  <label>max tokens <input id="maxtok" type="number" min="64" max="128000" step="64" value="20000"></label>
   <label>temperature <input id="temp" type="number" min="0" max="2" step="0.1" value="0.7"></label>
   <label>system <input id="sys" type="text" placeholder="(optional system prompt)" style="width:260px"></label>
 </div>
@@ -332,7 +332,7 @@ def _router_chat(payload: dict, timeout: float = 180.0):
     body = {
         "model": payload["model"],
         "messages": payload["messages"],
-        "max_tokens": int(payload.get("max_tokens", 2048)),
+        "max_tokens": int(payload.get("max_tokens", 20000)),
         "temperature": float(payload.get("temperature", 0.7)),
         "stream": False,
     }
