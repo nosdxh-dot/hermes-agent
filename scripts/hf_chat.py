@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 
 ROUTER = "https://router.huggingface.co/v1/chat/completions"
-MAX_TOKENS = 2048
+MAX_TOKENS = 20000
 
 
 def _send(token: str, model: str, messages: list) -> dict:
