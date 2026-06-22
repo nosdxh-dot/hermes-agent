@@ -120,20 +120,36 @@ def _build_icns(png: Path, out_icns: Path, work: Path) -> bool:
         return False
 
 
-LAUNCHER = """#!/bin/bash
-# Start the HF chat server via the login shell so HF_TOKEN (from ~/.zshrc) and
-# the right python3 are on PATH, then open the browser. Re-clicking just opens
-# the tab if the server is already running.
-exec /bin/zsh -ilc '
-  PORT={port}
-  URL="http://127.0.0.1:$PORT"
-  if lsof -ti:$PORT >/dev/null 2>&1; then
-    open "$URL"
-  else
-    ( sleep 1.2; open "$URL" ) &
-    exec python3 "{hf_ui}" "$HF_TOKEN"
-  fi
-'
+LAUNCHER = r"""#!/bin/bash
+# Launched by Finder with no terminal attached, so we DON'T run an interactive
+# shell as the main process (that exits instantly -> the icon just bounces).
+# Instead we capture HF_TOKEN and the python3 path from the user's zsh env via
+# short subshells, log everything, and surface failures with a dialog.
+LOG="$HOME/Library/Logs/Kimi.log"
+exec >>"$LOG" 2>&1
+echo "=== Kimi launch $(date) ==="
+PORT=__PORT__
+URL="http://127.0.0.1:$PORT"
+
+# Pull values out of the login+interactive zsh environment (sources ~/.zshrc).
+TOKEN="$(/bin/zsh -ilc 'print -r -- $HF_TOKEN' 2>/dev/null | tail -n1)"
+PY="$(/bin/zsh -ilc 'command -v python3' 2>/dev/null | tail -n1)"
+[ -x "$PY" ] || PY="/usr/bin/python3"
+echo "python=$PY token_len=${#TOKEN}"
+
+if [ -z "$TOKEN" ]; then
+  osascript -e 'display dialog "Kimi could not find HF_TOKEN.\n\nOpen Terminal and confirm:\n  echo $HF_TOKEN\n\nIt must be exported in ~/.zshrc (export HF_TOKEN=hf_...)." buttons {"OK"} with title "Kimi" with icon caution'
+  exit 1
+fi
+
+if lsof -ti:"$PORT" >/dev/null 2>&1; then
+  echo "server already up; opening browser"
+  open "$URL"
+  exit 0
+fi
+( sleep 1.2; open "$URL" ) &
+echo "starting server: $PY __HFUI__"
+exec "$PY" "__HFUI__" "$TOKEN"
 """
 
 
@@ -160,7 +176,7 @@ def build_app(dest_dir: Path) -> Path:
 
     # Launcher
     launch = macos / "launch"
-    launch.write_text(LAUNCHER.format(port=PORT, hf_ui=HF_UI))
+    launch.write_text(LAUNCHER.replace("__PORT__", str(PORT)).replace("__HFUI__", str(HF_UI)))
     launch.chmod(0o755)
 
     # Info.plist
