@@ -29,6 +29,7 @@ ROUTER = "https://router.huggingface.co/v1"
 TOKEN = ""
 _SESSION: dict = {"tokens": 0, "cost": 0.0, "requests": 0, "by_model": {}, "start": ""}
 _AGENT: dict = {"cancel": False}
+_PENDING: dict = {}  # approval_id -> {"event": threading.Event, "decision": str|None}
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -168,6 +169,13 @@ PAGE = r"""<!doctype html>
   details.aresult pre code{font:12px/1.5 var(--font-mono);white-space:pre-wrap;word-break:break-word}
   .afinal{border-left:3px solid var(--success);padding:6px 0 6px 12px;margin-top:4px}
   .aerr{color:var(--error);font-size:13px;padding:6px 0}
+  .approve{display:flex;gap:8px;align-items:center;padding:8px 10px;
+    border-top:1px solid var(--border);background:var(--surface)}
+  .approve button{padding:5px 12px;font-size:12px;font-weight:600}
+  .approve button.ok{background:var(--success);color:#0b160d;border:none}
+  .approve button.no{background:var(--error);color:#1a0f12;border:none}
+  .approve .amsg{font-size:12px;color:var(--warning)}
+  .approve .amsg.ok{color:var(--success)} .approve .amsg.no{color:var(--error)}
   ::-webkit-scrollbar{width:9px;height:9px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
@@ -201,12 +209,13 @@ PAGE = r"""<!doctype html>
     <div class="sb-sec">
       <div class="sb-label">Agent mode</div>
       <label class="row"><input type="checkbox" id="agent"> autonomous (uses tools)</label>
+      <label class="row"><input type="checkbox" id="approve"> ask before each command</label>
       <label>working dir
         <input id="workdir" type="text" value="~/hermes-agent" spellcheck="false"></label>
       <label>max steps
         <input id="maxsteps" type="number" min="1" max="50" value="12"></label>
       <div class="muted small" style="margin-top:6px">Runs bash / edits files on this
-        machine until the goal is done.</div>
+        machine until the goal is done. Approval gates bash &amp; file writes.</div>
     </div>
     <div class="sb-sec">
       <div class="sb-label">Live usage <button id="usageRefresh" class="mini" title="Refresh">↻</button></div>
@@ -358,7 +367,12 @@ function clearChat(){ history=[]; totalTok=0; totalCost=0;
   chat.innerHTML='<div class="empty" id="empty"><h2>◆ Cleared</h2><div>New conversation. Type below to begin.</div></div>'; }
 // ── Agent mode ─────────────────────────────────────────────────────────────
 let agentCtrl=null;
-function handleAgentEvent(ev,root){
+function resolveApproval(id,decision,ap){
+  ap.innerHTML='<span class="amsg">'+decision+'…</span>';
+  fetch("/api/agent/approve",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id,decision})}).catch(()=>{});
+}
+function handleAgentEvent(ev,root,cards){
   if(ev.type==="step"){
     const d=document.createElement("div"); d.className="astep";
     d.textContent="step "+ev.n+" / "+ev.max; root.appendChild(d);
@@ -375,7 +389,18 @@ function handleAgentEvent(ev,root){
     const d=document.createElement("div"); d.className="atool";
     d.innerHTML='<div class="atool-h">▸ '+esc(ev.name)+'</div>'+
       '<pre class="atool-cmd"><code>'+esc(arg)+'</code></pre>';
-    root.appendChild(d);
+    if(ev.needs_approval){ const ap=document.createElement("div"); ap.className="approve";
+      ap.innerHTML='<span class="amsg">waiting for approval…</span>'; d.appendChild(ap); }
+    root.appendChild(d); if(cards) cards[ev.id]=d;
+  } else if(ev.type==="approval_request"){
+    const d=cards&&cards[ev.id]; if(!d) return; const ap=d.querySelector(".approve"); if(!ap) return;
+    ap.innerHTML='<button class="ok">Approve</button><button class="no">Deny</button>';
+    ap.querySelector(".ok").onclick=()=>resolveApproval(ev.id,"approve",ap);
+    ap.querySelector(".no").onclick=()=>resolveApproval(ev.id,"deny",ap);
+  } else if(ev.type==="approval_resolved"){
+    const d=cards&&cards[ev.id]; if(!d) return; const ap=d.querySelector(".approve"); if(!ap) return;
+    const k=ev.decision==="approve"?"ok":"no";
+    ap.innerHTML='<span class="amsg '+k+'">'+esc(ev.decision||"")+'</span>';
   } else if(ev.type==="tool_result"){
     const d=document.createElement("details"); d.className="aresult";
     d.innerHTML='<summary>output</summary><pre><code>'+esc(ev.output||"")+'</code></pre>';
@@ -396,6 +421,7 @@ async function runAgent(){
   history.push({role:"user",content:goal});
   const panel=bubble("bot",'<div class="agent"></div>');
   const root=panel.querySelector(".agent");
+  const cards={};
   agentCtrl=new AbortController();
   let finalText="";
   try{
@@ -403,6 +429,7 @@ async function runAgent(){
       headers:{"Content-Type":"application/json"}, signal:agentCtrl.signal,
       body:JSON.stringify({model:modelSel.value, goal, history,
         workdir:$("#workdir").value, max_steps:+$("#maxsteps").value,
+        approve_each:$("#approve").checked,
         max_tokens:+$("#maxtok").value, temperature:+$("#temp").value})});
     const reader=r.body.getReader(); const dec=new TextDecoder(); let buf="";
     while(true){
@@ -412,7 +439,7 @@ async function runAgent(){
         const line=buf.slice(0,nl).trim(); buf=buf.slice(nl+1);
         if(!line) continue;
         let ev; try{ ev=JSON.parse(line); }catch(_){ continue; }
-        handleAgentEvent(ev,root);
+        handleAgentEvent(ev,root,cards);
         if(ev.type==="final") finalText=ev.content||"";
       }
     }
@@ -612,7 +639,11 @@ def _router_chat_agent(model, messages, max_tokens, temperature, timeout=180.0):
     return choice.get("message", {}) or {}, usage
 
 
-def run_agent(model, messages, workdir, max_steps, max_tokens, temperature):
+APPROVAL_TOOLS = ("bash", "write_file")  # mutating actions that need an OK
+
+
+def run_agent(model, messages, workdir, max_steps, max_tokens, temperature,
+              approve_each=False):
     """Generator yielding NDJSON-able event dicts as the agent works."""
     _AGENT["cancel"] = False
     for step in range(1, max_steps + 1):
@@ -652,9 +683,32 @@ def run_agent(model, messages, workdir, max_steps, max_tokens, temperature):
                 a = json.loads(raw) if isinstance(raw, str) else (raw or {})
             except Exception:
                 a = {"_raw": raw}
-            yield {"type": "tool_call", "name": name, "args": a, "id": tc.get("id")}
-            result = "(stopped by user)" if _AGENT["cancel"] else _exec_tool(name, a, workdir)
-            yield {"type": "tool_result", "name": name, "output": result, "id": tc.get("id")}
+            tcid = tc.get("id") or f"s{step}-{name}"
+            need_ok = approve_each and name in APPROVAL_TOOLS and not _AGENT["cancel"]
+            yield {"type": "tool_call", "name": name, "args": a, "id": tcid,
+                   "needs_approval": need_ok}
+
+            if _AGENT["cancel"]:
+                result = "(stopped by user)"
+            elif need_ok:
+                ev = threading.Event()
+                _PENDING[tcid] = {"event": ev, "decision": None}
+                yield {"type": "approval_request", "id": tcid}
+                ok = ev.wait(600)  # wait up to 10 min for the human
+                decision = (_PENDING.pop(tcid, {}) or {}).get("decision") if ok else "timeout"
+                yield {"type": "approval_resolved", "id": tcid,
+                       "decision": decision or "deny"}
+                if _AGENT["cancel"]:
+                    result = "(stopped by user)"
+                elif decision == "approve":
+                    result = _exec_tool(name, a, workdir)
+                else:
+                    result = ("(denied by user — do NOT retry this exact action; "
+                              "take a different approach or finish and report).")
+            else:
+                result = _exec_tool(name, a, workdir)
+
+            yield {"type": "tool_result", "name": name, "output": result, "id": tcid}
             messages.append({"role": "tool", "tool_call_id": tc.get("id"),
                              "name": name, "content": result})
     yield {"type": "final", "content": "(reached max steps without finishing — "
@@ -718,6 +772,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/agent/stop":
             _AGENT["cancel"] = True
             return self._json(200, {"ok": True})
+        if self.path == "/api/agent/approve":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                p = json.loads(self.rfile.read(n).decode())
+            except Exception as e:
+                return self._json(400, {"error": str(e)})
+            rec = _PENDING.get(p.get("id"))
+            if rec:
+                rec["decision"] = p.get("decision", "deny")
+                rec["event"].set()
+            return self._json(200, {"ok": bool(rec)})
         if self.path == "/api/agent":
             return self._agent()
         if self.path != "/api/chat":
@@ -743,6 +808,7 @@ class Handler(BaseHTTPRequestHandler):
         max_steps = max(1, min(50, int(p.get("max_steps", 12))))
         max_tokens = int(p.get("max_tokens", 4096))
         temperature = float(p.get("temperature", 0.3))
+        approve_each = bool(p.get("approve_each"))
         messages = ([{"role": "system", "content": AGENT_SYSTEM.format(workdir=workdir)}]
                     + list(p.get("history") or [])
                     + [{"role": "user", "content": goal}])
@@ -751,7 +817,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         try:
-            for ev in run_agent(model, messages, workdir, max_steps, max_tokens, temperature):
+            for ev in run_agent(model, messages, workdir, max_steps, max_tokens,
+                                temperature, approve_each):
                 self.wfile.write((json.dumps(ev) + "\n").encode())
                 self.wfile.flush()
             self.wfile.write((json.dumps({"type": "done"}) + "\n").encode())
