@@ -120,14 +120,33 @@ def main() -> int:
         "messages": [
             {"role": "user", "content": "Write a haiku about open-source models."}
         ],
-        "max_tokens": 100,
+        # Generous budget: reasoning models spend tokens "thinking" before they
+        # emit the visible answer, so a small cap can truncate before any
+        # content is produced.
+        "max_tokens": 512,
     }
     try:
         _, out = _post(f"{ROUTER}/chat/completions", token, body)
-        content = out["choices"][0]["message"]["content"]
+        choice = out["choices"][0]
+        msg = choice.get("message", {})
+        content = (msg.get("content") or "").strip()
+        reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+        finish = choice.get("finish_reason")
+
         print("  PASS  model responded:\n")
-        for line in content.strip().splitlines():
-            print(f"    {line}")
+        if content:
+            for line in content.splitlines():
+                print(f"    {line}")
+        elif reasoning:
+            print("    (no final content — showing reasoning output instead)")
+            for line in reasoning.splitlines():
+                print(f"    {line}")
+        else:
+            print("    (empty response)")
+
+        if finish == "length":
+            print("\n  NOTE  finish_reason=length — output hit max_tokens and was cut")
+            print("        off. Raise max_tokens for reasoning models if truncated.")
         usage = out.get("usage", {})
         if usage:
             print(f"\n  tokens: {usage}")
