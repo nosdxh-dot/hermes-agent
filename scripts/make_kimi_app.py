@@ -163,7 +163,7 @@ fi
 # Start the server only if it is not already listening.
 if ! lsof -ti:"$PORT" >/dev/null 2>&1; then
   echo "starting server: $PY __HFUI__" >>"$LOG" 2>&1
-  nohup "$PY" "__HFUI__" "$HF_TOKEN" >>"$LOG" 2>&1 &
+  nohup "$PY" "__HFUI__" "$HF_TOKEN" "$PORT" >>"$LOG" 2>&1 &
   sleep 1.6
 fi
 
@@ -232,18 +232,57 @@ def build_app(dest_dir: Path) -> Path:
     return app
 
 
+COMMAND_FILE = r"""#!/bin/bash
+# Double-click me: Terminal opens and runs the HF chat server in the foreground.
+# You see exactly what happens, it inherits your shell environment, and it can
+# never "bounce" or report "not open anymore" the way a .app bundle can.
+# Stop it with Ctrl-C or by closing this window.
+export HF_TOKEN="${HF_TOKEN:-__TOKEN__}"
+PY="__PYTHON__"
+[ -x "$PY" ] || PY="$(command -v python3 || echo /usr/bin/python3)"
+PORT=__PORT__
+URL="http://127.0.0.1:$PORT"
+echo "Starting HF chat at $URL  (python: $PY)"
+if lsof -ti:"$PORT" >/dev/null 2>&1; then
+  echo "Already running — just opening the browser."
+  open "$URL"; exit 0
+fi
+( sleep 1.6; open "$URL" ) &
+exec "$PY" "__HFUI__" "$HF_TOKEN" "$PORT"
+"""
+
+
+def build_command_file(dest_dir: Path) -> Path:
+    token = _resolve_build_token()
+    python = sys.executable or "/usr/bin/python3"
+    cmd = dest_dir / f"{APP_NAME}.command"
+    cmd.write_text(COMMAND_FILE
+                   .replace("__PORT__", str(PORT))
+                   .replace("__TOKEN__", token)
+                   .replace("__PYTHON__", python)
+                   .replace("__HFUI__", str(HF_UI)))
+    cmd.chmod(0o755)
+    return cmd
+
+
 def main() -> int:
     if sys.platform != "darwin":
-        print("This builds a macOS .app and must be run on your Mac.", file=sys.stderr)
+        print("This builds a macOS launcher and must be run on your Mac.", file=sys.stderr)
         return 1
     if not HF_UI.exists():
         print(f"Cannot find {HF_UI}", file=sys.stderr)
         return 1
 
     desktop = Path.home() / "Desktop"
-    print(f"Building {APP_NAME}.app …")
+
+    # The bulletproof launcher first — a double-clickable .command.
+    cmd = build_command_file(desktop)
+    print(f"✓ Created {cmd}  (double-click this — most reliable)")
+
+    # The pretty .app with the custom icon (can be finicky on some setups).
+    print(f"\nBuilding {APP_NAME}.app …")
     app = build_app(desktop)
-    print(f"\n✓ Created {app}")
+    print(f"✓ Created {app}")
 
     if "--apps" in sys.argv:
         dest = Path("/Applications") / f"{APP_NAME}.app"
@@ -252,8 +291,10 @@ def main() -> int:
         shutil.copytree(app, dest)
         print(f"✓ Copied to {dest}")
 
-    print("\nDouble-click it on your Desktop. First launch: right-click → Open")
-    print("(Gatekeeper warns on unsigned apps — only needed the first time).")
+    print("\nTwo launchers are on your Desktop:")
+    print(f"  • {APP_NAME}.command  — double-click; opens Terminal + browser (always works)")
+    print(f"  • {APP_NAME}.app      — pretty icon; right-click → Open the first time")
+    print("\nIf .command warns about an unidentified developer: right-click → Open.")
     return 0
 
 
