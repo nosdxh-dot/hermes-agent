@@ -17,6 +17,7 @@ Press Ctrl-C in the terminal to stop the server.
 import datetime
 import json
 import os
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -27,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROUTER = "https://router.huggingface.co/v1"
 TOKEN = ""
 _SESSION: dict = {"tokens": 0, "cost": 0.0, "requests": 0, "by_model": {}, "start": ""}
+_AGENT: dict = {"cancel": False}
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -144,6 +146,28 @@ PAGE = r"""<!doctype html>
   .send{background:var(--accent);color:var(--bg);border:none;font-weight:600;
     padding:9px 16px}
   .send:hover{background:var(--accent-strong);color:var(--text)}
+  .stop{background:var(--error);color:#1a0f12;border:none;font-weight:600;padding:9px 16px}
+  .sb-sec label.row{flex-direction:row;align-items:center;gap:8px;cursor:pointer}
+  .sb-sec label.row input{width:auto;margin:0}
+  /* agent trace */
+  .agent{display:flex;flex-direction:column;gap:8px}
+  .astep{color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+    border-top:1px solid var(--border);padding-top:8px;margin-top:2px}
+  .athink{font-size:13.5px}
+  .atool{background:var(--code);border:1px solid var(--border);border-radius:var(--radius);
+    overflow:hidden}
+  .atool-h{padding:6px 10px;color:var(--accent);font-size:12px;font-weight:600;
+    border-bottom:1px solid var(--border)}
+  .atool-cmd{margin:0;padding:9px 11px;background:transparent;border:none}
+  .atool-cmd code{font:12.5px/1.5 var(--font-mono);color:var(--text)}
+  details.aresult{border:1px solid var(--border);border-radius:var(--radius);
+    padding:6px 10px;background:var(--bg)}
+  details.aresult summary{cursor:pointer;color:var(--muted);font-size:11.5px}
+  details.aresult pre{margin:8px 0 0;background:var(--code);border:1px solid var(--border);
+    border-radius:var(--radius);padding:10px;overflow-x:auto;max-height:320px}
+  details.aresult pre code{font:12px/1.5 var(--font-mono);white-space:pre-wrap;word-break:break-word}
+  .afinal{border-left:3px solid var(--success);padding:6px 0 6px 12px;margin-top:4px}
+  .aerr{color:var(--error);font-size:13px;padding:6px 0}
   ::-webkit-scrollbar{width:9px;height:9px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
@@ -175,6 +199,16 @@ PAGE = r"""<!doctype html>
         <textarea id="sys" rows="2" placeholder="(optional)"></textarea></label>
     </div>
     <div class="sb-sec">
+      <div class="sb-label">Agent mode</div>
+      <label class="row"><input type="checkbox" id="agent"> autonomous (uses tools)</label>
+      <label>working dir
+        <input id="workdir" type="text" value="~/hermes-agent" spellcheck="false"></label>
+      <label>max steps
+        <input id="maxsteps" type="number" min="1" max="50" value="12"></label>
+      <div class="muted small" style="margin-top:6px">Runs bash / edits files on this
+        machine until the goal is done.</div>
+    </div>
+    <div class="sb-sec">
       <div class="sb-label">Live usage <button id="usageRefresh" class="mini" title="Refresh">↻</button></div>
       <div id="usageGrid" class="usage-grid"><div class="muted small">— send a message —</div></div>
       <div class="muted small" id="usageTime" style="margin-top:6px"></div>
@@ -198,6 +232,7 @@ PAGE = r"""<!doctype html>
     <textarea id="box" placeholder="Message the model…" rows="1"
       autocomplete="off" spellcheck="false" aria-label="Message input"></textarea>
     <button id="send" class="send">Send</button>
+    <button id="stop" class="stop" style="display:none">Stop</button>
   </div>
 </footer>
 <script>
@@ -321,10 +356,82 @@ async function loadUsage(){
 function clearChat(){ history=[]; totalTok=0; totalCost=0;
   $("#totals").textContent="0 tokens · $0.00000";
   chat.innerHTML='<div class="empty" id="empty"><h2>◆ Cleared</h2><div>New conversation. Type below to begin.</div></div>'; }
+// ── Agent mode ─────────────────────────────────────────────────────────────
+let agentCtrl=null;
+function handleAgentEvent(ev,root){
+  if(ev.type==="step"){
+    const d=document.createElement("div"); d.className="astep";
+    d.textContent="step "+ev.n+" / "+ev.max; root.appendChild(d);
+  } else if(ev.type==="assistant" && (ev.content||ev.reasoning)){
+    const d=document.createElement("div"); d.className="athink";
+    if(ev.reasoning){ const dt=document.createElement("details"); dt.className="think";
+      dt.innerHTML='<summary>reasoning</summary><div class="body">'+esc(ev.reasoning)+'</div>'; d.appendChild(dt);}
+    if(ev.content){ const c=document.createElement("div"); c.innerHTML=md(ev.content); d.appendChild(c);}
+    root.appendChild(d); wireCopy(d);
+  } else if(ev.type==="tool_call"){
+    const arg = ev.name==="bash" ? (ev.args.command||"")
+              : ev.name==="write_file" ? (ev.args.path||"")+"\n"+(ev.args.content||"")
+              : (ev.args.path!=null ? ev.args.path : JSON.stringify(ev.args));
+    const d=document.createElement("div"); d.className="atool";
+    d.innerHTML='<div class="atool-h">▸ '+esc(ev.name)+'</div>'+
+      '<pre class="atool-cmd"><code>'+esc(arg)+'</code></pre>';
+    root.appendChild(d);
+  } else if(ev.type==="tool_result"){
+    const d=document.createElement("details"); d.className="aresult";
+    d.innerHTML='<summary>output</summary><pre><code>'+esc(ev.output||"")+'</code></pre>';
+    root.appendChild(d);
+  } else if(ev.type==="final"){
+    const d=document.createElement("div"); d.className="afinal";
+    d.innerHTML=md(ev.content||"(done)"); root.appendChild(d); wireCopy(d);
+  } else if(ev.type==="error"){
+    const d=document.createElement("div"); d.className="aerr"; d.textContent=ev.message; root.appendChild(d);
+  }
+  scrollDown();
+}
+async function runAgent(){
+  if(busy) return; const goal=box.value.trim(); if(!goal) return;
+  busy=true; send.disabled=true; box.value=""; box.style.height="auto";
+  $("#stop").style.display="";
+  bubble("user",md(goal));
+  history.push({role:"user",content:goal});
+  const panel=bubble("bot",'<div class="agent"></div>');
+  const root=panel.querySelector(".agent");
+  agentCtrl=new AbortController();
+  let finalText="";
+  try{
+    const r=await fetch("/api/agent",{method:"POST",
+      headers:{"Content-Type":"application/json"}, signal:agentCtrl.signal,
+      body:JSON.stringify({model:modelSel.value, goal, history,
+        workdir:$("#workdir").value, max_steps:+$("#maxsteps").value,
+        max_tokens:+$("#maxtok").value, temperature:+$("#temp").value})});
+    const reader=r.body.getReader(); const dec=new TextDecoder(); let buf="";
+    while(true){
+      const {value,done}=await reader.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true}); let nl;
+      while((nl=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,nl).trim(); buf=buf.slice(nl+1);
+        if(!line) continue;
+        let ev; try{ ev=JSON.parse(line); }catch(_){ continue; }
+        handleAgentEvent(ev,root);
+        if(ev.type==="final") finalText=ev.content||"";
+      }
+    }
+  }catch(e){ if(e.name!=="AbortError"){
+    root.insertAdjacentHTML("beforeend",'<div class="aerr">'+esc(String(e))+'</div>'); } }
+  if(finalText) history.push({role:"assistant",content:finalText});
+  busy=false; send.disabled=false; $("#stop").style.display="none"; agentCtrl=null;
+  box.focus(); scrollDown(); loadUsage();
+}
+function submit(){ if($("#agent").checked) runAgent(); else ask(); }
 // ── Events ───────────────────────────────────────────────────────────────
-send.onclick=ask;
-box.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask();}});
+send.onclick=submit;
+$("#stop").onclick=()=>{ if(agentCtrl) agentCtrl.abort();
+  fetch("/api/agent/stop",{method:"POST"}).catch(()=>{}); };
+box.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();submit();}});
 box.addEventListener("input",()=>{box.style.height="auto";box.style.height=Math.min(box.scrollHeight,180)+"px";});
+$("#agent").addEventListener("change",e=>{
+  box.placeholder=e.target.checked?"Give the agent a goal — it'll work on its own…":"Message the model…";
+});
 $("#clear").onclick=clearChat;
 $("#usageRefresh").onclick=loadUsage;
 document.addEventListener("keydown",e=>{
@@ -396,6 +503,164 @@ def _router_chat(payload: dict, timeout: float = 180.0):
     }
 
 
+# ── Agent mode ────────────────────────────────────────────────────────────
+AGENT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "bash",
+        "description": "Run a bash command in the working directory and return "
+                       "combined stdout/stderr. Use for builds, tests, git, "
+                       "searching, installing, anything a shell can do.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "Shell command to run."}},
+            "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a UTF-8 text file and return its contents.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Create or overwrite a text file with the given content.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "list_dir",
+        "description": "List the entries in a directory.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}}, "required": ["path"]}}},
+]
+
+AGENT_SYSTEM = (
+    "You are an autonomous coding agent running directly on the user's machine, "
+    "similar to Claude Code. You have these tools: bash, read_file, write_file, "
+    "list_dir. Your working directory is {workdir}.\n\n"
+    "Work the goal end to end on your own: break it into steps and EXECUTE them "
+    "with the tools. Do not ask the user for confirmation or for more input — "
+    "keep going until the goal is fully accomplished. Inspect before you change "
+    "(read files, list dirs, run commands), make the change, then verify it "
+    "(run the build/tests). Prefer paths relative to the working directory. Be "
+    "careful with destructive commands. When the goal is complete, stop calling "
+    "tools and reply with a short summary of what you did and how you verified it."
+)
+
+
+def _trunc(s: str, n: int = 6000) -> str:
+    return s if len(s) <= n else s[:n] + f"\n…[truncated {len(s) - n} chars]"
+
+
+def _agent_workdir(wd) -> str:
+    wd = os.path.expanduser((wd or "~").strip())
+    return wd if os.path.isdir(wd) else os.path.expanduser("~")
+
+
+def _resolve(path: str, workdir: str) -> str:
+    path = os.path.expanduser(path)
+    return path if os.path.isabs(path) else os.path.join(workdir, path)
+
+
+def _exec_tool(name: str, args: dict, workdir: str) -> str:
+    try:
+        if name == "bash":
+            cmd = args.get("command", "")
+            p = subprocess.run(cmd, shell=True, cwd=workdir, capture_output=True,
+                               text=True, timeout=120)
+            out = ((p.stdout or "") + (p.stderr or "")).strip()
+            return _trunc(out or f"(exit {p.returncode}, no output)")
+        if name == "read_file":
+            with open(_resolve(args["path"], workdir), encoding="utf-8",
+                      errors="replace") as f:
+                return _trunc(f.read())
+        if name == "write_file":
+            path = _resolve(args["path"], workdir)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            content = args.get("content", "")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"wrote {len(content)} bytes to {path}"
+        if name == "list_dir":
+            return _trunc("\n".join(sorted(os.listdir(_resolve(args.get("path", "."), workdir)))))
+        return f"unknown tool: {name}"
+    except subprocess.TimeoutExpired:
+        return "error: command timed out (120s)"
+    except Exception as e:
+        return f"error: {e}"
+
+
+def _router_chat_agent(model, messages, max_tokens, temperature, timeout=180.0):
+    body = {"model": model, "messages": messages, "max_tokens": int(max_tokens),
+            "temperature": float(temperature), "tools": AGENT_TOOLS,
+            "tool_choice": "auto", "stream": False}
+    req = urllib.request.Request(f"{ROUTER}/chat/completions",
+                                 data=json.dumps(body).encode())
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "hermes-hf-ui/agent")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = json.loads(r.read().decode())
+    choice = out["choices"][0]
+    usage = out.get("usage", {})
+    tok = int(usage.get("total_tokens") or 0)
+    cost = float(usage.get("estimated_cost") or 0)
+    _SESSION["requests"] += 1
+    _SESSION["tokens"] += tok
+    _SESSION["cost"] += cost
+    bm = _SESSION["by_model"].setdefault(model, {"tokens": 0, "cost": 0.0, "requests": 0})
+    bm["tokens"] += tok
+    bm["cost"] += cost
+    bm["requests"] += 1
+    return choice.get("message", {}) or {}, usage
+
+
+def run_agent(model, messages, workdir, max_steps, max_tokens, temperature):
+    """Generator yielding NDJSON-able event dicts as the agent works."""
+    _AGENT["cancel"] = False
+    for step in range(1, max_steps + 1):
+        if _AGENT["cancel"]:
+            yield {"type": "final", "content": "(stopped by user)"}
+            return
+        yield {"type": "step", "n": step, "max": max_steps}
+        try:
+            msg, usage = _router_chat_agent(model, messages, max_tokens, temperature)
+        except urllib.error.HTTPError as e:
+            yield {"type": "error", "message": f"HTTP {e.code}: {e.read().decode()[:300]}"}
+            return
+        except Exception as e:
+            yield {"type": "error", "message": str(e)}
+            return
+
+        content = (msg.get("content") or "").strip()
+        reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+        tool_calls = msg.get("tool_calls") or []
+        if content or reasoning:
+            yield {"type": "assistant", "content": content, "reasoning": reasoning}
+
+        if tool_calls:
+            messages.append({"role": "assistant", "content": msg.get("content") or "",
+                             "tool_calls": tool_calls})
+        else:
+            messages.append({"role": "assistant", "content": msg.get("content") or ""})
+            yield {"type": "final", "content": content or reasoning or "(no output)",
+                   "usage": usage}
+            return
+
+        for tc in tool_calls:
+            fn = tc.get("function", {}) or {}
+            name = fn.get("name", "")
+            raw = fn.get("arguments") or "{}"
+            try:
+                a = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except Exception:
+                a = {"_raw": raw}
+            yield {"type": "tool_call", "name": name, "args": a, "id": tc.get("id")}
+            result = "(stopped by user)" if _AGENT["cancel"] else _exec_tool(name, a, workdir)
+            yield {"type": "tool_result", "name": name, "output": result, "id": tc.get("id")}
+            messages.append({"role": "tool", "tool_call_id": tc.get("id"),
+                             "name": name, "content": result})
+    yield {"type": "final", "content": "(reached max steps without finishing — "
+           "raise max steps or refine the goal)"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
@@ -450,6 +715,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/api/agent/stop":
+            _AGENT["cancel"] = True
+            return self._json(200, {"ok": True})
+        if self.path == "/api/agent":
+            return self._agent()
         if self.path != "/api/chat":
             return self._json(404, {"error": "not found"})
         try:
@@ -460,6 +730,34 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"error": f"HTTP {e.code}: {e.read().decode()[:300]}"})
         except Exception as e:
             self._json(200, {"error": str(e)})
+
+    def _agent(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            p = json.loads(self.rfile.read(n).decode())
+        except Exception as e:
+            return self._json(400, {"error": str(e)})
+        model = p.get("model", "")
+        goal = (p.get("goal") or "").strip()
+        workdir = _agent_workdir(p.get("workdir"))
+        max_steps = max(1, min(50, int(p.get("max_steps", 12))))
+        max_tokens = int(p.get("max_tokens", 4096))
+        temperature = float(p.get("temperature", 0.3))
+        messages = ([{"role": "system", "content": AGENT_SYSTEM.format(workdir=workdir)}]
+                    + list(p.get("history") or [])
+                    + [{"role": "user", "content": goal}])
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            for ev in run_agent(model, messages, workdir, max_steps, max_tokens, temperature):
+                self.wfile.write((json.dumps(ev) + "\n").encode())
+                self.wfile.flush()
+            self.wfile.write((json.dumps({"type": "done"}) + "\n").encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            _AGENT["cancel"] = True
 
 
 def main() -> int:
