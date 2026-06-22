@@ -14,6 +14,7 @@ Then open the printed http://127.0.0.1:<port> (it auto-opens your browser).
 Press Ctrl-C in the terminal to stop the server.
 """
 
+import datetime
 import json
 import os
 import sys
@@ -25,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROUTER = "https://router.huggingface.co/v1"
 TOKEN = ""
+_SESSION: dict = {"tokens": 0, "cost": 0.0, "requests": 0, "by_model": {}, "start": ""}
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -97,6 +99,21 @@ PAGE = r"""<!doctype html>
   .hint{max-width:820px;margin:6px auto 0;color:var(--muted);font-size:11.5px;text-align:center}
   .empty{color:var(--muted);text-align:center;margin-top:60px}
   .empty h2{margin:0 0 6px;font-size:18px;color:var(--ink)}
+  .usage-panel{background:var(--panel);border-bottom:1px solid var(--line);
+    padding:0 16px;max-height:0;overflow:hidden;transition:max-height .25s ease,padding .25s ease}
+  .usage-panel.open{max-height:600px;padding:14px 16px}
+  .usage-grid{max-width:820px;margin:0 auto;display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+  .ucard{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .ucard .ulabel{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+  .ucard .uval{font-size:20px;font-weight:600;line-height:1.1}
+  .ucard .usub{color:var(--muted);font-size:11.5px;margin-top:3px}
+  .ucard.wide{grid-column:1/-1}
+  .utable{width:100%;border-collapse:collapse;margin-top:8px;font-size:12.5px}
+  .utable th{color:var(--muted);font-weight:500;text-align:left;padding:3px 8px;border-bottom:1px solid var(--line)}
+  .utable td{padding:5px 8px;border-bottom:1px solid var(--line)}
+  .usage-foot{max-width:820px;margin:10px auto 0;display:flex;gap:10px;align-items:center;
+    color:var(--muted);font-size:11.5px}
 </style>
 </head>
 <body>
@@ -104,6 +121,7 @@ PAGE = r"""<!doctype html>
   <div class="title"><span id="dot" class="dot"></span> HF Inference Chat</div>
   <select id="model" title="Model"></select>
   <button id="clear" title="Clear conversation">Clear</button>
+  <button id="usageBtn" title="Show/hide live usage stats">Usage</button>
   <div class="spacer"></div>
   <div class="stat" id="totals">0 tokens · $0.00000</div>
 </header>
@@ -111,6 +129,16 @@ PAGE = r"""<!doctype html>
   <label>max tokens <input id="maxtok" type="number" min="64" max="32000" step="64" value="2048"></label>
   <label>temperature <input id="temp" type="number" min="0" max="2" step="0.1" value="0.7"></label>
   <label>system <input id="sys" type="text" placeholder="(optional system prompt)" style="width:260px"></label>
+</div>
+<div class="usage-panel" id="usagePanel">
+  <div class="usage-grid" id="usageGrid">
+    <div style="color:var(--muted);font-size:13px">Loading…</div>
+  </div>
+  <div class="usage-foot">
+    <span id="usageTime"></span>
+    <button id="usageRefresh" style="font-size:11.5px;padding:3px 9px">↻ Refresh</button>
+    <span style="margin-left:auto">Usage is session-only · cost estimates from router</span>
+  </div>
 </div>
 <main><div class="wrap" id="chat">
   <div class="empty" id="empty">
@@ -206,6 +234,7 @@ async function ask(){
   }catch(e){ holder.innerHTML='<p style="color:var(--bad)">'+esc(String(e))+'</p>'; }
   busy=false; send.disabled=false; box.focus();
   document.querySelector("main").scrollTop=document.querySelector("main").scrollHeight;
+  if(typeof usageOpen!=="undefined"&&usageOpen) loadUsage();
 }
 function fullHistory(){
   const sys=$("#sys").value.trim();
@@ -215,6 +244,62 @@ send.onclick=ask;
 box.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask();}});
 box.addEventListener("input",()=>{box.style.height="auto";box.style.height=Math.min(box.scrollHeight,180)+"px";});
 $("#clear").onclick=()=>{history=[];chat.innerHTML='<div class="empty" id="empty"><h2>Cleared</h2><div>New conversation. Type below to begin.</div></div>';};
+// ── Usage panel ──────────────────────────────────────────────────────────
+let usageOpen=false, usageTimer=null;
+const usagePanel=$("#usagePanel");
+function fmtN(n){return Number(n||0).toLocaleString();}
+function fmtC(n){return "$"+(+n||0).toFixed(5);}
+async function loadUsage(){
+  try{
+    const r=await fetch("/api/usage"); const d=await r.json();
+    let html="";
+    const acc=d.account||{};
+    if(acc.name){
+      const tier=acc.isPro?"Pro ✦":"Free";
+      html+=`<div class="ucard"><div class="ulabel">Account</div>
+        <div class="uval" style="font-size:14px">${esc(acc.fullname||acc.name)}</div>
+        <div class="usub">@${esc(acc.name)} · ${tier} · ${esc(acc.role||"token")}</div></div>`;
+    } else if(acc.error){
+      html+=`<div class="ucard"><div class="ulabel">Account</div><div class="usub" style="color:var(--bad)">${esc(acc.error)}</div></div>`;
+    }
+    html+=`<div class="ucard"><div class="ulabel">Requests</div>
+      <div class="uval">${fmtN(d.requests)}</div>
+      <div class="usub">this session</div></div>`;
+    html+=`<div class="ucard"><div class="ulabel">Tokens</div>
+      <div class="uval">${fmtN(d.tokens)}</div>
+      <div class="usub">total billed</div></div>`;
+    html+=`<div class="ucard"><div class="ulabel">Est. Cost</div>
+      <div class="uval">${fmtC(d.cost)}</div>
+      <div class="usub">USD this session</div></div>`;
+    const models=Object.entries(d.by_model||{});
+    if(models.length){
+      html+=`<div class="ucard wide"><div class="ulabel">By model</div>
+        <table class="utable"><thead><tr><th>Model</th><th>Req</th><th>Tokens</th><th>Est. Cost</th></tr></thead><tbody>`;
+      models.sort((a,b)=>b[1].tokens-a[1].tokens).forEach(([m,v])=>{
+        html+=`<tr><td>${esc(m)}</td><td>${fmtN(v.requests)}</td><td>${fmtN(v.tokens)}</td><td>${fmtC(v.cost)}</td></tr>`;
+      });
+      html+="</tbody></table></div>";
+    }
+    if(d.start) html+=`<div class="ucard"><div class="ulabel">Session started</div>
+      <div class="uval" style="font-size:13px">${esc(d.start)}</div></div>`;
+    $("#usageGrid").innerHTML=html||'<div style="color:var(--muted);font-size:13px">No requests yet.</div>';
+    $("#usageTime").textContent="Updated "+new Date().toLocaleTimeString();
+  }catch(e){
+    $("#usageGrid").innerHTML='<div style="color:var(--bad);font-size:13px">'+esc(String(e))+'</div>';
+  }
+}
+$("#usageBtn").onclick=()=>{
+  usageOpen=!usageOpen;
+  usagePanel.classList.toggle("open",usageOpen);
+  if(usageOpen){
+    loadUsage();
+    usageTimer=usageTimer||setInterval(loadUsage,60000);
+  } else {
+    if(usageTimer){clearInterval(usageTimer);usageTimer=null;}
+  }
+};
+$("#usageRefresh").onclick=loadUsage;
+// ─────────────────────────────────────────────────────────────────────────
 loadModels(); box.focus();
 </script>
 </body>
@@ -234,6 +319,15 @@ def _router_get_models(timeout: float = 15.0):
     return sorted(ids)
 
 
+def _hf_whoami(timeout: float = 10.0) -> dict:
+    req = urllib.request.Request("https://huggingface.co/api/whoami-v2")
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "hermes-hf-ui/1.1")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
 def _router_chat(payload: dict, timeout: float = 180.0):
     body = {
         "model": payload["model"],
@@ -251,11 +345,23 @@ def _router_chat(payload: dict, timeout: float = 180.0):
         out = json.loads(r.read().decode())
     choice = out["choices"][0]
     msg = choice.get("message", {})
+    usage = out.get("usage", {})
+    tok = int(usage.get("total_tokens") or 0)
+    cost = float(usage.get("estimated_cost") or 0)
+    model_key = body["model"]
+    _SESSION["requests"] += 1
+    _SESSION["tokens"] += tok
+    _SESSION["cost"] += cost
+    if model_key not in _SESSION["by_model"]:
+        _SESSION["by_model"][model_key] = {"tokens": 0, "cost": 0.0, "requests": 0}
+    _SESSION["by_model"][model_key]["tokens"] += tok
+    _SESSION["by_model"][model_key]["cost"] += cost
+    _SESSION["by_model"][model_key]["requests"] += 1
     return {
         "content": msg.get("content") or "",
         "reasoning": msg.get("reasoning_content") or msg.get("reasoning") or "",
         "finish_reason": choice.get("finish_reason"),
-        "usage": out.get("usage", {}),
+        "usage": usage,
     }
 
 
@@ -286,6 +392,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"error": f"HTTP {e.code}: {e.read().decode()[:200]}"})
             except Exception as e:
                 self._json(200, {"error": str(e)})
+        elif self.path == "/api/usage":
+            data: dict = {
+                "requests": _SESSION["requests"],
+                "tokens": _SESSION["tokens"],
+                "cost": _SESSION["cost"],
+                "by_model": _SESSION["by_model"],
+                "start": _SESSION["start"],
+            }
+            try:
+                me = _hf_whoami()
+                tok_info = (me.get("auth", {}) or {}).get("accessToken", {}) or {}
+                data["account"] = {
+                    "name": me.get("name", ""),
+                    "fullname": me.get("fullname", "") or me.get("name", ""),
+                    "type": me.get("type", ""),
+                    "isPro": bool(me.get("isPro")),
+                    "role": tok_info.get("role", ""),
+                }
+            except urllib.error.HTTPError as e:
+                data["account"] = {"error": f"HTTP {e.code}: {e.read().decode()[:120]}"}
+            except Exception as e:
+                data["account"] = {"error": str(e)[:120]}
+            self._json(200, data)
         else:
             self._json(404, {"error": "not found"})
 
@@ -315,6 +444,8 @@ def main() -> int:
         print("FAIL: no token. Set HF_TOKEN or pass it as the first argument.",
               file=sys.stderr)
         return 1
+
+    _SESSION["start"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     url = f"http://127.0.0.1:{port}"
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
