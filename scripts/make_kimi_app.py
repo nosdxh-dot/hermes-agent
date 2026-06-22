@@ -120,25 +120,42 @@ def _build_icns(png: Path, out_icns: Path, work: Path) -> bool:
         return False
 
 
+def _resolve_build_token() -> str:
+    """Find HF_TOKEN at build time: env first, then the user's login zsh."""
+    tok = os.environ.get("HF_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        out = subprocess.run(["/bin/zsh", "-ilc", "print -r -- $HF_TOKEN"],
+                             capture_output=True, text=True, timeout=10)
+        for line in reversed(out.stdout.splitlines()):
+            line = line.strip()
+            if line.startswith("hf_"):
+                return line
+    except Exception:
+        pass
+    return ""
+
+
 LAUNCHER = r"""#!/bin/bash
-# Launched by Finder with no terminal attached, so we DON'T run an interactive
-# shell as the main process (that exits instantly -> the icon just bounces).
-# Instead we capture HF_TOKEN and the python3 path from the user's zsh env via
-# short subshells, log everything, and surface failures with a dialog.
+# A Finder-launched app cannot see your shell's HF_TOKEN or conda python3, and
+# running an interactive shell as the main process exits instantly (the icon
+# just bounces). So the builder BAKES the token + python path in at build time
+# (captured from your terminal, where they exist). No runtime shell resolution.
 LOG="$HOME/Library/Logs/Kimi.log"
 exec >>"$LOG" 2>&1
 echo "=== Kimi launch $(date) ==="
 PORT=__PORT__
 URL="http://127.0.0.1:$PORT"
 
-# Pull values out of the login+interactive zsh environment (sources ~/.zshrc).
-TOKEN="$(/bin/zsh -ilc 'print -r -- $HF_TOKEN' 2>/dev/null | tail -n1)"
-PY="$(/bin/zsh -ilc 'command -v python3' 2>/dev/null | tail -n1)"
-[ -x "$PY" ] || PY="/usr/bin/python3"
-echo "python=$PY token_len=${#TOKEN}"
+# Runtime env wins if present (e.g. launched from a terminal), else the baked value.
+export HF_TOKEN="${HF_TOKEN:-__TOKEN__}"
+PY="__PYTHON__"
+[ -x "$PY" ] || PY="$(command -v python3 || echo /usr/bin/python3)"
+echo "python=$PY token_len=${#HF_TOKEN}"
 
-if [ -z "$TOKEN" ]; then
-  osascript -e 'display dialog "Kimi could not find HF_TOKEN.\n\nOpen Terminal and confirm:\n  echo $HF_TOKEN\n\nIt must be exported in ~/.zshrc (export HF_TOKEN=hf_...)." buttons {"OK"} with title "Kimi" with icon caution'
+if [ -z "$HF_TOKEN" ]; then
+  osascript -e 'display dialog "Kimi has no HF_TOKEN baked in. Re-run the builder from a terminal where HF_TOKEN is set:\n\n  python3 ~/hermes-agent/scripts/make_kimi_app.py" buttons {"OK"} with title "Kimi" with icon caution'
   exit 1
 fi
 
@@ -149,7 +166,7 @@ if lsof -ti:"$PORT" >/dev/null 2>&1; then
 fi
 ( sleep 1.2; open "$URL" ) &
 echo "starting server: $PY __HFUI__"
-exec "$PY" "__HFUI__" "$TOKEN"
+exec "$PY" "__HFUI__" "$HF_TOKEN"
 """
 
 
@@ -174,9 +191,19 @@ def build_app(dest_dir: Path) -> Path:
         shutil.copy(png, res / "icon.png")
     png.unlink(missing_ok=True)
 
-    # Launcher
+    # Launcher — bake in the token + python captured from the build environment.
+    token = _resolve_build_token()
+    python = sys.executable or "/usr/bin/python3"
+    print(f"  baking: python={python} token_len={len(token)}")
+    if not token:
+        print("  WARNING: HF_TOKEN not found in this shell — the app will prompt"
+              " you to rebuild. Run: export HF_TOKEN=hf_... then re-run this.")
     launch = macos / "launch"
-    launch.write_text(LAUNCHER.replace("__PORT__", str(PORT)).replace("__HFUI__", str(HF_UI)))
+    launch.write_text(LAUNCHER
+                      .replace("__PORT__", str(PORT))
+                      .replace("__TOKEN__", token)
+                      .replace("__PYTHON__", python)
+                      .replace("__HFUI__", str(HF_UI)))
     launch.chmod(0o755)
 
     # Info.plist
