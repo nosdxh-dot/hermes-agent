@@ -324,10 +324,13 @@ async function ask(){
   bubble("user",md(text));
   history.push({role:"user",content:text});
   const holder=bubble("bot",'<span class="typing"><span></span><span></span><span></span></span>');
+  setStatus(true,"waiting…");
+  const retryTimer=setTimeout(()=>setStatus(true,"retrying 504…"),6000);
   try{
     const r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({model:modelSel.value,messages:fullHistory(),
         max_tokens:+$("#maxtok").value,temperature:+$("#temp").value})});
+    clearTimeout(retryTimer);
     const d=await r.json();
     if(d.error){ holder.innerHTML='<p style="color:var(--error)">'+esc(d.error)+'</p>'; }
     else{
@@ -348,7 +351,7 @@ async function ask(){
       wireCopy(holder);
       history.push({role:"assistant",content:content||reasoning});
     }
-  }catch(e){ holder.innerHTML='<p style="color:var(--error)">'+esc(String(e))+'</p>'; }
+  }catch(e){ clearTimeout(retryTimer); holder.innerHTML='<p style="color:var(--error)">'+esc(String(e))+'</p>'; }
   busy=false; send.disabled=false; box.focus(); scrollDown();
   loadUsage();
 }
@@ -557,6 +560,36 @@ def _hf_whoami(timeout: float = 10.0) -> dict:
         return json.loads(r.read().decode())
 
 
+import time as _time
+
+_RETRY_CODES = {502, 503, 504, 429}
+_RETRY_DELAYS = [3, 8, 20]  # seconds between attempts (3 tries total after the first)
+
+
+def _post_json(url: str, body: dict, timeout: float) -> dict:
+    """POST JSON to url with retry on transient 5xx/429, return parsed JSON."""
+    encoded = json.dumps(body).encode()
+    last_err = None
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+        if delay:
+            _time.sleep(delay)
+        req = urllib.request.Request(url, data=encoded)
+        req.add_header("Authorization", f"Bearer {TOKEN}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "hermes-hf-ui/1.1")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code not in _RETRY_CODES:
+                raise
+        except Exception as e:
+            last_err = e
+            raise
+    raise last_err
+
+
 def _router_chat(payload: dict, timeout: float = 180.0):
     body = {
         "model": payload["model"],
@@ -565,13 +598,7 @@ def _router_chat(payload: dict, timeout: float = 180.0):
         "temperature": float(payload.get("temperature", 0.7)),
         "stream": False,
     }
-    req = urllib.request.Request(f"{ROUTER}/chat/completions",
-                                 data=json.dumps(body).encode())
-    req.add_header("Authorization", f"Bearer {TOKEN}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", "hermes-hf-ui/1.0")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.loads(r.read().decode())
+    out = _post_json(f"{ROUTER}/chat/completions", body, timeout)
     choice = out["choices"][0]
     msg = choice.get("message", {})
     usage = out.get("usage", {})
@@ -757,13 +784,7 @@ def _router_chat_agent(model, messages, max_tokens, temperature, timeout=180.0):
     body = {"model": model, "messages": messages, "max_tokens": int(max_tokens),
             "temperature": float(temperature), "tools": AGENT_TOOLS,
             "tool_choice": "auto", "stream": False}
-    req = urllib.request.Request(f"{ROUTER}/chat/completions",
-                                 data=json.dumps(body).encode())
-    req.add_header("Authorization", f"Bearer {TOKEN}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", "hermes-hf-ui/agent")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.loads(r.read().decode())
+    out = _post_json(f"{ROUTER}/chat/completions", body, timeout)
     choice = out["choices"][0]
     usage = out.get("usage", {})
     tok = int(usage.get("total_tokens") or 0)
