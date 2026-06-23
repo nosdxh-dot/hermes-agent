@@ -1,5 +1,5 @@
 name: huggingface-provider
 kind: model-provider
-version: 1.0.0
-description: HuggingFace Inference Providers
+version: 1.1.0
+description: HuggingFace Inference Providers — 20+ open models via router.huggingface.co
 author: Nous Research
